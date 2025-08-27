@@ -2,6 +2,8 @@
 update_interval: 60
 # Maximum backoff in minutes when failing to fetch feeds (defaults to 5 days)
 max_backoff: 7200
+# How many feeds to poll in parallel? Set to 0 to disable limit.
+poll_parallelism_limit: 10
 # The time to sleep between send requests when broadcasting a new feed entry.
 # Set to 0 to disable sleep or -1 to run all requests asynchronously at once.
 spam_sleep: 2
