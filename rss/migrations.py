@@ -20,10 +20,16 @@ upgrade_table = UpgradeTable()
 
 @upgrade_table.register(description="Latest revision", upgrades_to=3)
 async def upgrade_latest(conn: Connection, scheme: Scheme) -> None:
-    gen = "GENERATED ALWAYS AS IDENTITY" if scheme != Scheme.SQLITE else ""
+    if scheme == Scheme.SQLITE:
+        id_column = "INTEGER"
+    elif scheme == Scheme.POSTGRES:
+        id_column = "SERIAL"
+    else:
+        id_column = "INTEGER AUTO_INCREMENT"
+    
     await conn.execute(
         f"""CREATE TABLE IF NOT EXISTS feed (
-            id       INTEGER {gen},
+            id       {id_column},
             url      TEXT NOT NULL,
             title    TEXT NOT NULL,
             subtitle TEXT NOT NULL,
