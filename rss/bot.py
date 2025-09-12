@@ -37,14 +37,29 @@ from mautrix.types import (
     PowerLevelStateEventContent,
     RoomID,
     StateEvent,
+    MessageEventContent,
+    TextMessageEventContent,
+    Format
 )
 from mautrix.util.async_db import UpgradeTable
+from mautrix.util import markdown
 from mautrix.util.config import BaseProxyConfig, ConfigUpdateHelper
+from mautrix.util.formatter import EntityType, MarkdownString, MatrixParser
 
 from .db import DBManager, Entry, Feed, Subscription
 from .migrations import upgrade_table
 
 rss_change_level = EventType.find("xyz.maubot.rss", t_class=EventType.Class.STATE)
+
+class HumanReadableString(MarkdownString):
+    def format(self, entity_type: EntityType, **kwargs) -> MarkdownString:
+        if entity_type == EntityType.URL and kwargs["url"] != self.text:
+            self.text = f"{self.text} ({kwargs['url']})"
+            return self
+        return super(HumanReadableString, self).format(entity_type, **kwargs)
+
+class MaubotHTMLParser(MatrixParser[HumanReadableString]):
+    fs = HumanReadableString
 
 
 class Config(BaseProxyConfig):
@@ -125,13 +140,38 @@ class RSSBot(Plugin):
                 **attr.asdict(entry),
             }
         )
-        msgtype = MessageType.NOTICE if sub.send_notice else MessageType.TEXT
+        msgtype = MessageType.TEXT
         try:
             return await self.client.send_markdown(
                 sub.room_id, message, msgtype=msgtype, allow_html=True
             )
         except Exception as e:
             self.log.warning(f"Failed to send {entry.id} of {feed.id} to {sub.room_id}: {e}")
+
+    async def _parse_formatted(
+        self, message: str, allow_html: bool = True, render_markdown: bool = True
+    ) -> tuple[str, str]:
+        if render_markdown:
+            html_content = markdown.render(message, allow_html=allow_html)
+        elif allow_html:
+            html_content = message
+        else:
+            return message, html.escape(message)
+        text = (await MaubotHTMLParser().parse(html_content)).text
+        if len(text) > 100 and len(text) + len(html_content) > 40000:
+            text = text[:100] + "[long message cut off]"
+        return text, html_content
+
+    async def _send_text_reply(self, reply_to: MessageEvent, message: str, allow_html: bool = True, render_markdown: bool = True) -> EventID:
+        content = TextMessageEventContent(msgtype=MessageType.TEXT, body=message)
+        content.set_reply(reply_to)
+        if render_markdown or allow_html:
+            content.format = Format.HTML
+            content.body, content.formatted_body = await self._parse_formatted(message, allow_html=allow_html, render_markdown=render_markdown)
+        try:
+            return await self.client.send_message_event(reply_to.room_id, EventType.ROOM_MESSAGE, content)
+        except Exception as e:
+            self.log.warning(f"Failed to send reply to {reply_to.event_id} in {reply_to.room_id}: {e}")
 
     async def _broadcast(
         self, feed: Feed, entry: Entry, subscriptions: list[Subscription]
@@ -341,8 +381,8 @@ class RSSBot(Plugin):
         if not isinstance(state_level, int):
             state_level = 50
         if user_level < state_level:
-            await evt.reply(
-                "You don't have the permission to manage the subscriptions of this room."
+            await self._send_text_reply(
+                evt, "You don't have the permission to manage the subscriptions of this room."
             )
             return False
         return True
@@ -352,20 +392,19 @@ class RSSBot(Plugin):
         help="Manage this RSS bot",
         require_subcommand=True,
     )
-    async def rss(self) -> None:
-        pass
+    async def rss(self, evt: MessageEvent) -> None:
+        if not await self.can_manage(evt):
+            return
 
     @rss.subcommand("subscribe", aliases=("s", "sub"), help="Subscribe this room to a feed.")
     @command.argument("url", "feed URL", pass_raw=True)
     async def subscribe(self, evt: MessageEvent, url: str) -> None:
-        if not await self.can_manage(evt):
-            return
         feed = await self.dbm.get_feed_by_url(url)
         if not feed:
             try:
                 info, entries = await self.parse_feed(url=url)
             except Exception as e:
-                await evt.reply(f"Failed to load feed: {e}")
+                await self._send_text_reply(evt, f"Failed to load feed: {e}")
                 return
             feed = await self.dbm.create_feed(info)
             await self.dbm.add_entries(entries, override_feed_id=feed.id)
@@ -379,26 +418,24 @@ class RSSBot(Plugin):
                 if sub.user_id == evt.sender
                 else f"[{sub.user_id}](https://matrix.to/#/{sub.user_id})"
             )
-            await evt.reply(f"{subscriber} had already subscribed this room to {feed_info}")
+            await self._send_text_reply(evt, f"{subscriber} had already subscribed this room to {feed_info}", render_markdown=True)
         else:
             await self.dbm.subscribe(
                 feed.id, evt.room_id, evt.sender, self.config["notification_template"]
             )
-            await evt.reply(f"Subscribed to {feed_info}")
+            await self._send_text_reply(evt, f"Subscribed to {feed_info}", render_markdown=True)
 
     @rss.subcommand(
         "unsubscribe", aliases=("u", "unsub"), help="Unsubscribe this room from a feed."
     )
     @command.argument("feed_id", "feed ID", parser=int)
     async def unsubscribe(self, evt: MessageEvent, feed_id: int) -> None:
-        if not await self.can_manage(evt):
-            return
         sub, feed = await self.dbm.get_subscription(feed_id, evt.room_id)
         if not sub:
-            await evt.reply("This room is not subscribed to that feed")
+            await self._send_text_reply(evt, "This room is not subscribed to that feed")
             return
         await self.dbm.unsubscribe(feed.id, evt.room_id)
-        await evt.reply(f"Unsubscribed from feed ID {feed.id}: [{feed.title}]({feed.url})")
+        await self._send_text_reply(evt, f"Unsubscribed from feed ID {feed.id}: [{feed.title}]({feed.url})", render_markdown=True)
 
     @rss.subcommand(
         "template",
@@ -408,19 +445,17 @@ class RSSBot(Plugin):
     @command.argument("feed_id", "feed ID", parser=int)
     @command.argument("template", "new template", pass_raw=True, required=False)
     async def command_template(self, evt: MessageEvent, feed_id: int, template: str) -> None:
-        if not await self.can_manage(evt):
-            return
         sub, feed = await self.dbm.get_subscription(feed_id, evt.room_id)
         if not sub:
-            await evt.reply("This room is not subscribed to that feed")
+            await self._send_text_reply(evt, "This room is not subscribed to that feed")
             return
         if not template:
-            await evt.reply(
-                '<p>Current template in this room:</p><pre><code language="markdown">'
+            await self._send_text_reply(
+                evt, '<p>Current template in this room:</p><pre><code language="markdown">'
                 f"{html.escape(sub.notification_template.template)}"
                 "</code></pre>",
                 allow_html=True,
-                markdown=False,
+                render_markdown=False
             )
             return
         await self.dbm.update_template(feed.id, evt.room_id, template)
@@ -439,30 +474,29 @@ class RSSBot(Plugin):
             summary="This is a sample entry to demonstrate your new template",
             link="http://example.com",
         )
-        await evt.reply(f"Template for feed ID {feed.id} updated. Sample notification:")
+        await self._send_text_reply(evt, f"Template for feed ID {feed.id} updated. Sample notification:")
         await self._send(feed, sample_entry, sub)
 
-    @rss.subcommand(
-        "notice", aliases=("n",), help="Set whether or not the bot should send updates as m.notice"
-    )
-    @command.argument("feed_id", "feed ID", parser=int)
-    @BoolArgument("setting", "true/false")
-    async def command_notice(self, evt: MessageEvent, feed_id: int, setting: bool) -> None:
-        if not await self.can_manage(evt):
-            return
-        sub, feed = await self.dbm.get_subscription(feed_id, evt.room_id)
-        if not sub:
-            await evt.reply("This room is not subscribed to that feed")
-            return
-        await self.dbm.set_send_notice(feed.id, evt.room_id, setting)
-        send_type = "m.notice" if setting else "m.text"
-        await evt.reply(f"Updates for feed ID {feed.id} will now be sent as `{send_type}`")
+    # @rss.subcommand(
+    #     "notice", aliases=("n",), help="Set whether or not the bot should send updates as m.notice"
+    # )
+    # @command.argument("feed_id", "feed ID", parser=int)
+    # @BoolArgument("setting", "true/false")
+    # async def command_notice(self, evt: MessageEvent, feed_id: int, setting: bool) -> None:
+    #     if not await self.can_manage(evt):
+    #         return
+    #     sub, feed = await self.dbm.get_subscription(feed_id, evt.room_id)
+    #     if not sub:
+    #         await evt.reply("This room is not subscribed to that feed")
+    #         return
+    #     await self.dbm.set_send_notice(feed.id, evt.room_id, setting)
+    #     send_type = "m.text"
+    #     await evt.reply(f"Updates for feed ID {feed.id} will now be sent as `{send_type}`")
 
     @staticmethod
     def _format_subscription(feed: Feed, subscriber: str) -> str:
         msg = (
             f"* {feed.id} - [{feed.title}]({feed.url}) "
-            f"(subscribed by [{subscriber}](https://matrix.to/#/{subscriber}))"
         )
         if feed.error_count > 1:
             msg += f"  \n  ⚠️ The last {feed.error_count} attempts to fetch the feed have failed!"
@@ -476,13 +510,14 @@ class RSSBot(Plugin):
     async def command_subscriptions(self, evt: MessageEvent) -> None:
         subscriptions = await self.dbm.get_feeds_by_room(evt.room_id)
         if len(subscriptions) == 0:
-            await evt.reply("There are no RSS subscriptions in this room")
+            await self._send_text_reply(evt, "There are no RSS subscriptions in this room")
             return
-        await evt.reply(
-            "**Subscriptions in this room:**\n\n"
+        await self._send_text_reply(
+            evt, "**Subscriptions in this room:**\n\n"
             + "\n".join(
                 self._format_subscription(feed, subscriber) for feed, subscriber in subscriptions
-            )
+            ),
+            render_markdown=True
         )
 
     @event.on(EventType.ROOM_TOMBSTONE)
