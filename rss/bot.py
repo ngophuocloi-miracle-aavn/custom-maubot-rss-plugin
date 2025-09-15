@@ -317,7 +317,7 @@ class RSSBot(Plugin):
     ) -> tuple[Feed, list[Entry]]:
         content = await resp.read()
         headers = {"Content-Location": feed.url, **resp.headers, "Content-Encoding": "identity"}
-        parsed_data = feedparser.parse(io.BytesIO(content), response_headers=headers)
+        parsed_data = feedparser.parse(feed.url)
         if parsed_data.bozo:
             if not isinstance(parsed_data.bozo_exception, feedparser.ThingsNobodyCaresAboutButMe):
                 raise parsed_data.bozo_exception
